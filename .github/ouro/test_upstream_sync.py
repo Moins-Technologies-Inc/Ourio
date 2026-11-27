@@ -205,6 +205,20 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(self.fx.plan(), {"status": "fast_forward", "target": merge, "mirror": side})
         del a
 
+    def test_mirror_on_a_side_branch_waits_for_its_merge(self):
+        # The commit before the merge is old enough but does not contain the
+        # mirror; the merge is too new. Nothing may be planned.
+        self.fx.commit("a", 30)
+        git(self.fx.repo, "checkout", "-q", "-b", "side")
+        side = self.fx.commit("side", 25)
+        git(self.fx.repo, "checkout", "-q", "upstream")
+        self.fx.commit("main2", 24)
+        stamp = f"@{NOW - 1 * DAY} +0000"
+        git(self.fx.repo, "merge", "-q", "--no-ff", "-m", "merge", "side",
+            env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
+        self.fx.mirror_at(side)
+        self.assertEqual(self.fx.plan(), {"status": "too_new", "target": None, "mirror": side})
+
     def test_unknown_ref_raises(self):
         a = self.fx.commit("a", 30)
         self.fx.mirror_at(a)
