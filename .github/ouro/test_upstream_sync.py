@@ -95,38 +95,84 @@ class PlanTests(unittest.TestCase):
         self.fx.mirror_at(a)
         self.assertEqual(self.fx.plan()["target"], b)
 
-    def test_up_to_date_when_only_new_commits_remain(self):
+    def test_too_new_when_only_new_commits_remain(self):
         a = self.fx.commit("a", 30)
         self.fx.commit("b", 2)
         self.fx.mirror_at(a)
-        self.assertEqual(self.fx.plan(), {"status": "up_to_date", "target": a, "mirror": a})
+        self.assertEqual(self.fx.plan(), {"status": "too_new", "target": None, "mirror": a})
 
-    def test_up_to_date_when_mirror_is_ahead_of_target(self):
+    def test_up_to_date_when_mirror_equals_upstream(self):
         # Mirror was synced by hand to a commit newer than the cutoff.
         self.fx.commit("a", 30)
         b = self.fx.commit("b", 2)
         self.fx.mirror_at(b)
-        self.assertEqual(self.fx.plan()["status"], "up_to_date")
+        self.assertEqual(self.fx.plan(), {"status": "up_to_date", "target": None, "mirror": b})
+
+    def test_too_new_when_mirror_is_ahead_of_the_cutoff(self):
+        self.fx.commit("a", 30)
+        b = self.fx.commit("b", 2)
+        self.fx.commit("c", 1)
+        self.fx.mirror_at(b)
+        self.assertEqual(self.fx.plan()["status"], "too_new")
 
     def test_too_new_when_no_upstream_commit_is_old_enough(self):
-        a = self.fx.commit("a", 1)
+        a = self.fx.commit("a", 3)
+        self.fx.commit("b", 1)
         self.fx.mirror_at(a)
         self.assertEqual(self.fx.plan(), {"status": "too_new", "target": None, "mirror": a})
 
-    def test_diverged_mirror_is_reported(self):
+    def test_backdated_commit_does_not_pull_in_a_new_one(self):
+        # b is 1 day old; c claims 20 days. Taking c would bring b in early.
+        a = self.fx.commit("a", 30)
+        self.fx.commit("b", 1)
+        self.fx.commit("c", 20)
+        self.fx.mirror_at(a)
+        self.assertEqual(self.fx.plan()["status"], "too_new")
+
+    def test_stops_before_the_first_new_commit(self):
+        a = self.fx.commit("a", 30)
+        b = self.fx.commit("b", 10)
+        self.fx.commit("c", 1)
+        self.fx.commit("d", 20)
+        self.fx.mirror_at(a)
+        self.assertEqual(self.fx.plan(), {"status": "fast_forward", "target": b, "mirror": a})
+
+    def _stray_mirror(self):
         base = self.fx.commit("a", 30)
         self.fx.commit("b", 20)
         git(self.fx.repo, "checkout", "-q", "-b", "side", base)
         stray = self.fx.commit("stray", 15)
         git(self.fx.repo, "checkout", "-q", "upstream")
         self.fx.mirror_at(stray)
+        return stray
+
+    def test_diverged_mirror_is_reported(self):
+        stray = self._stray_mirror()
         result = self.fx.plan()
         self.assertEqual(result["status"], "diverged")
         self.assertEqual(result["mirror"], stray)
 
-    def test_follows_first_parent_only(self):
-        # A merged side branch with an old commit must not become the target
-        # when the merge commit itself is too new.
+    def test_diverged_when_mirror_is_upstream_plus_a_stray_commit(self):
+        self.fx.commit("a", 30)
+        b = self.fx.commit("b", 20)
+        git(self.fx.repo, "checkout", "-q", "-b", "side", b)
+        stray = self.fx.commit("stray", 15)
+        git(self.fx.repo, "checkout", "-q", "upstream")
+        self.fx.mirror_at(stray)
+        self.assertEqual(self.fx.plan()["status"], "diverged")
+
+    def test_diverged_when_off_upstream_and_everything_is_new(self):
+        base = self.fx.commit("a", 3)
+        self.fx.commit("b", 2)
+        git(self.fx.repo, "checkout", "-q", "-b", "side", base)
+        stray = self.fx.commit("stray", 1)
+        git(self.fx.repo, "checkout", "-q", "upstream")
+        self.fx.mirror_at(stray)
+        self.assertEqual(self.fx.plan()["status"], "diverged")
+
+    def test_merge_commit_date_gates_its_side_branch(self):
+        # A merged side branch with an old commit must not come in while the
+        # merge commit itself is too new.
         a = self.fx.commit("a", 30)
         git(self.fx.repo, "checkout", "-q", "-b", "side")
         self.fx.commit("side", 20)
@@ -143,7 +189,21 @@ class PlanTests(unittest.TestCase):
             env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp},
         )
         self.fx.mirror_at(a)
-        self.assertEqual(self.fx.plan()["status"], "up_to_date")
+        self.assertEqual(self.fx.plan()["status"], "too_new")
+
+    def test_mirror_on_a_merged_side_branch_fast_forwards_past_the_merge(self):
+        a = self.fx.commit("a", 30)
+        git(self.fx.repo, "checkout", "-q", "-b", "side")
+        side = self.fx.commit("side", 25)
+        git(self.fx.repo, "checkout", "-q", "upstream")
+        self.fx.commit("main2", 24)
+        stamp = f"@{NOW - 20 * DAY} +0000"
+        git(self.fx.repo, "merge", "-q", "--no-ff", "-m", "merge", "side",
+            env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
+        merge = git(self.fx.repo, "rev-parse", "HEAD")
+        self.fx.mirror_at(side)
+        self.assertEqual(self.fx.plan(), {"status": "fast_forward", "target": merge, "mirror": side})
+        del a
 
     def test_unknown_ref_raises(self):
         a = self.fx.commit("a", 30)

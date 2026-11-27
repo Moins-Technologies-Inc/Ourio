@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      actions: read
     env:
       UPSTREAM_URL: https://github.com/raphamorim/rio.git
     steps:
@@ -41,6 +42,23 @@ jobs:
             echo "::error::secret OURIO_SYNC_TOKEN is not set (see the header of this workflow)"
             exit 1
           fi
+
+      - name: Require release, update-flake and nix-build to be disabled (E337)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A push to main fires Rio's push-on-main workflows; release.yml must
+          # never run on the fork. Unregistered or enabled workflows block.
+          for wf in release.yml update-flake.yml nix-build.yml; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf" --jq .state 2>/dev/null || echo unregistered)
+            if [ "$state" != "disabled_manually" ]; then
+              echo "::error::$wf is $state; disable it first (gh workflow disable $wf -R $GITHUB_REPOSITORY)"
+              exit 1
+            fi
+          done
+
+      - name: Offline tests of the sync decision
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/ouro -p 'test_*.py'
 
       - name: Fetch Rio and the mirror
         run: |
@@ -63,11 +81,15 @@ jobs:
           TARGET: ${{ steps.plan.outputs.target }}
           MIRROR: ${{ steps.plan.outputs.mirror }}
         run: |
-          # --force-with-lease pins the expected old value; the ruleset on
-          # main rejects anything that is not a fast-forward anyway.
-          git -c credential.helper= \
-            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SYNC_TOKEN" | base64 -w0)" \
-            push --force-with-lease="refs/heads/main:$MIRROR" origin "$TARGET:refs/heads/main"
+          # Plain push: git itself refuses a non-fast-forward, the plan
+          # verified the ancestry, and the ruleset on main blocks rewrites.
+          header=$(printf 'x-access-token:%s' "$SYNC_TOKEN" | base64 -w0)
+          echo "::add-mask::$header"
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+          GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $header" \
+            git push origin "$TARGET:refs/heads/main"
           git update-ref refs/remotes/origin/main "$TARGET"
           echo "main: $MIRROR -> $TARGET" >> "$GITHUB_STEP_SUMMARY"
 
@@ -79,7 +101,9 @@ jobs:
             echo "ouro/main already contains main" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head main --base ouro/main --state open --json number --jq 'length')
+          owner="${GITHUB_REPOSITORY%%/*}"
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head main --base ouro/main --state open \
+            --json headRepositoryOwner --jq "[.[] | select(.headRepositoryOwner.login == \"$owner\")] | length")
           if [ "$open" != "0" ]; then
             echo "a main -> ouro/main pull request is already open" >> "$GITHUB_STEP_SUMMARY"
             exit 0
