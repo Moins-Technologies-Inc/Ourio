@@ -1,0 +1,113 @@
+# Branch strategy D (E337): fast-forward `main` to Rio with a 7-day delay,
+# then open one pull request main -> ouro/main.
+#
+# Needs the repository secret OURIO_SYNC_TOKEN (fine-grained token on this
+# repository only: Contents write, Workflows write, Pull requests write).
+# GITHUB_TOKEN cannot push upstream commits that touch .github/workflows,
+# and pull requests it opens do not start the test workflows.
+name: Ourio upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ourio-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Moins-Technologies-Inc/Ourio' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      UPSTREAM_URL: https://github.com/raphamorim/rio.git
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.OURIO_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::secret OURIO_SYNC_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - name: Require release, update-flake and nix-build to be disabled (E337)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A push to main fires Rio's push-on-main workflows; release.yml must
+          # never run on the fork. Unregistered or enabled workflows block.
+          for wf in release.yml update-flake.yml nix-build.yml; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf" --jq .state 2>/dev/null || echo unregistered)
+            if [ "$state" != "disabled_manually" ]; then
+              echo "::error::$wf is $state; disable it first (gh workflow disable $wf -R $GITHUB_REPOSITORY)"
+              exit 1
+            fi
+          done
+
+      - name: Offline tests of the sync decision
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/ouro -p 'test_*.py'
+
+      - name: Fetch Rio and the mirror
+        run: |
+          git fetch --no-tags "$UPSTREAM_URL" +refs/heads/main:refs/remotes/upstream/main
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main +refs/heads/ouro/main:refs/remotes/origin/ouro/main
+
+      - name: Plan
+        id: plan
+        run: |
+          python3 .github/ouro/upstream_sync.py \
+            --upstream-ref refs/remotes/upstream/main \
+            --mirror-ref refs/remotes/origin/main \
+            --min-age-days 7 \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Fast-forward main
+        if: steps.plan.outputs.status == 'fast_forward'
+        env:
+          SYNC_TOKEN: ${{ secrets.OURIO_SYNC_TOKEN }}
+          TARGET: ${{ steps.plan.outputs.target }}
+          MIRROR: ${{ steps.plan.outputs.mirror }}
+        run: |
+          # Plain push: git itself refuses a non-fast-forward, the plan
+          # verified the ancestry, and the ruleset on main blocks rewrites.
+          header=$(printf 'x-access-token:%s' "$SYNC_TOKEN" | base64 -w0)
+          echo "::add-mask::$header"
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+          GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $header" \
+            git push origin "$TARGET:refs/heads/main"
+          git update-ref refs/remotes/origin/main "$TARGET"
+          echo "main: $MIRROR -> $TARGET" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open the main -> ouro/main pull request
+        env:
+          GH_TOKEN: ${{ secrets.OURIO_SYNC_TOKEN }}
+        run: |
+          if git merge-base --is-ancestor refs/remotes/origin/main refs/remotes/origin/ouro/main; then
+            echo "ouro/main already contains main" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          owner="${GITHUB_REPOSITORY%%/*}"
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head main --base ouro/main --state open \
+            --json headRepositoryOwner --jq "[.[] | select(.headRepositoryOwner.login == \"$owner\")] | length")
+          if [ "$open" != "0" ]; then
+            echo "a main -> ouro/main pull request is already open" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh pr create --repo "$GITHUB_REPOSITORY" --head main --base ouro/main \
+            --title "Sync Rio upstream into ouro/main" \
+            --body "Automated by ourio-upstream-sync (E337). Merge with a merge commit only; never squash or rebase, so \`main\` stays an ancestor of \`ouro/main\`."
