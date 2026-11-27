@@ -1,3 +1,4 @@
+# Ourio: disabled on this fork (E337); kept byte-identical below so Rio updates merge cleanly.
 name: update-flake-lock
 on:
   workflow_dispatch:
